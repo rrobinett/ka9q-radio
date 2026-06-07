@@ -117,6 +117,20 @@ struct sdrstate {
   uint64_t last_sample_count; // Used to verify sample rate
   int64_t last_count_time;
   bool message_posted; // Clock rate error posted last time around
+  // RTP<->GPS offset / sample-loss monitor (agc_rx888, once per AGC_INTERVAL).
+  // The ADC clock is GPSDO-disciplined (external ref into the Si5351) and
+  // GPS_TIME is the host's GPS-disciplined clock, so the offset between host
+  // wallclock and the received-sample count must be CONSTANT.  Any step means
+  // samples were lost (USB transfer drop / xhci reset) or, if failures==0, a
+  // measurement artifact — never clock drift.  Logged here so the loss is
+  // visible and attributable instead of only surfacing as a downstream fault.
+  int64_t monitor_last_gps;            // gps_time_ns at last check
+  uint64_t monitor_last_samples;       // frontend->samples at last check
+  unsigned long monitor_last_failures; // failure_count at last check
+  bool monitor_init;                   // baseline captured
+  double cumulative_loss_sec;          // running total of offset movement
+  double clock_step_threshold;         // |move| (sec) over an interval to log; config
+  bool clock_rate_log;                 // always log measured rate each minute; config
   double scale;        // Scale samples for #bits and front end gain
   int undersample;     // Use undersample aliasing on baseband input for VHF/UHF. n = 1 => no undersampling
   double dc_offset;    // A/D offset, units, used only to adjust power reading. It just goes into the FFT DC bin
@@ -175,6 +189,8 @@ static char const *Rx888_keys[] = {
   "att", // synonym for atten
   "atten", // fixed attenuator gain, dB. Either -10 or +10 is interprepted as 10 dB of attenuation
   "calibrate", // Set to zero when an external GPSDO or Rb/Cs reference is used
+  "clock-rate-log", // Log measured sample rate every minute even when within tolerance
+  "clock-step-threshold", // |RTP<->GPS offset move| (sec) over an interval to log as sample loss; default 0.05
   "description",
   "device",
   "dither",  // Dither A/D LSB, not very useful with noisy antenna signals
@@ -251,6 +267,10 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
   // Enable/output output randomization
   sdr->randomizer = config_getboolean(dictionary,section,"rand",false);
   rx888_set_dither_and_randomizer(sdr,sdr->dither,sdr->randomizer);
+
+  // RTP<->GPS offset / sample-loss monitor thresholds (see agc_rx888)
+  sdr->clock_step_threshold = config_getdouble(dictionary,section,"clock-step-threshold",0.05); // seconds
+  sdr->clock_rate_log = config_getboolean(dictionary,section,"clock-rate-log",false);
 
   // RF Gain calibration
   // WA2ZKD measured several rx888s with very consistent results
@@ -558,18 +578,59 @@ static void *agc_rx888(void *arg){
   while((s = atomic_load(&sdr->state)) == RUNNING || s == STARTING){
     sleep(AGC_INTERVAL);
     int64_t now = gps_time_ns();
+
+    // ── RTP<->GPS offset-step / sample-loss monitor (every AGC_INTERVAL) ──
+    // The ADC clock is GPSDO-disciplined and GPS_TIME is the host's
+    // GPS-disciplined clock, so over any interval the host time should
+    // advance by exactly received_samples / nominal_rate.  A shortfall means
+    // samples were LOST (the host clock ran on while the ADC count didn't) —
+    // a USB transfer drop or xhci reset — which steps the published
+    // (GPS_TIME, RTP_TIMESNAP) offset by the lost duration.  Catching it at
+    // ~1 s resolution attributes the downstream timing fault to its cause;
+    // pairing it with the USB failure count separates real loss (failures>0)
+    // from a measurement artifact (failures==0).  Positive move == loss.
+    {
+      uint64_t const samples_now = frontend->samples;       // 64-bit aligned: atomic read
+      unsigned long const failures_now = sdr->failure_count;
+      if(sdr->monitor_init){
+	int64_t const d_gps = now - sdr->monitor_last_gps;
+	int64_t const d_samp = (int64_t)(samples_now - sdr->monitor_last_samples);
+	if(d_gps > 0 && frontend->samprate > 0){
+	  double const accounted_ns = (double)d_samp * BILLION / (double)frontend->samprate;
+	  double const move_sec = (double)(d_gps - (int64_t)accounted_ns) / BILLION;
+	  if(fabs(move_sec) > sdr->clock_step_threshold){
+	    sdr->cumulative_loss_sec += move_sec;
+	    unsigned long const d_fail = failures_now - sdr->monitor_last_failures;
+	    double const lost_samples = (double)d_gps * frontend->samprate / BILLION - (double)d_samp;
+	    fprintf(stderr,"RX888 RTP<->GPS offset STEPPED %+.3f s over %.1f s "
+		    "(~%'.0f samples %s; USB xfer failures +%lu; cumulative %+.3f s) — %s\n",
+		    move_sec, (double)d_gps/BILLION, fabs(lost_samples),
+		    lost_samples >= 0 ? "missing" : "extra", d_fail, sdr->cumulative_loss_sec,
+		    move_sec > 0 ? (d_fail > 0 ? "SAMPLE LOSS (USB transfer drop)"
+		                              : "SAMPLE LOSS (no USB failure flagged — investigate)")
+		                 : "host-clock step / extra samples");
+	  }
+	}
+      } else
+	sdr->monitor_init = true;
+      sdr->monitor_last_gps = now;
+      sdr->monitor_last_samples = samples_now;
+      sdr->monitor_last_failures = failures_now;
+    }
+
     if(now >= sdr->last_count_time + 60 * BILLION){
-      // Verify approximate sample rate once per minute
+      // Verify sample rate once per minute.  GPSDO-locked, so this should be
+      // ~0 ppm; a steady deficit indicates ongoing sample loss.
       int64_t const sampcount = frontend->samples - sdr->last_sample_count;
       double const rate = BILLION * (double)sampcount / (now - sdr->last_count_time);
-      double const error = fabs((rate - frontend->samprate) / (double)frontend->samprate);
+      double const error = (rate - frontend->samprate) / (double)frontend->samprate;
       sdr->last_count_time = now;
       sdr->last_sample_count = frontend->samples;
-      if(error > 0.01 || sdr->message_posted){
-	// Post message every time the clock is off by 1% or more, or if it has just returned to nominal
-	fprintf(stderr,"RX888 measured sample rate error: %'.1lf Hz vs nominal %'lf Hz\n",
-		rate,frontend->samprate);
-	sdr->message_posted = (error > 0.01);
+      if(sdr->clock_rate_log || fabs(error) > 0.01 || sdr->message_posted){
+	// Log every minute if clock-rate-log is set; otherwise on >=1% error or return to nominal.
+	fprintf(stderr,"RX888 measured sample rate: %'.1lf Hz vs nominal %'lf Hz (%+.2f ppm)\n",
+		rate,frontend->samprate,1e6*error);
+	sdr->message_posted = (fabs(error) > 0.01);
       }
     }
     double scaled_new_power = frontend->if_power * scale_ADpower2FS(frontend);
